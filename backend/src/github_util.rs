@@ -119,7 +119,11 @@ impl Display for GitHubUtilError {
         match self {
             GitHubUtilError::Request(err) => write!(f, "Request error: {}", err),
             GitHubUtilError::Json { source, body } => {
-                write!(f, "Failed to parse JSON: {}. Response body: {}", source, body)
+                write!(
+                    f,
+                    "Failed to parse JSON: {}. Response body: {}",
+                    source, body
+                )
             }
             GitHubUtilError::ResponseError(msg) => write!(f, "Response error: {}", msg),
         }

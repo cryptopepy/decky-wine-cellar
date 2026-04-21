@@ -19,6 +19,7 @@ import {
   Flavor,
   InstalledCompatibilityTool,
   InstalledToolSource,
+  OperationInfo,
   OperationKind,
   OperationState,
 } from "../types";
@@ -184,12 +185,16 @@ export default function FlavorTab({
                 operation.kind === OperationKind.Install &&
                 operation.release_id === release.id,
             );
-            const activeOperation =
+            const directInstallOperations = releaseOperations.filter((operation) =>
+              isDirectInstallOperation(operation),
+            );
+            const activeDirectInstallOperation =
               appState.current_operation != null &&
               appState.current_operation.release_id === release.id &&
-              appState.current_operation.kind === OperationKind.Install
+              isDirectInstallOperation(appState.current_operation)
                 ? appState.current_operation
                 : undefined;
+            const directInstallBusy = directInstallOperations.length !== 0;
 
             return (
               <li
@@ -204,11 +209,11 @@ export default function FlavorTab({
                 <span>
                   {release.release.tag_name}
                   {directInstallPresent && " (Installed)"}
-                  {releaseOperations.some(
+                  {directInstallOperations.some(
                     (operation) => operation.state === OperationState.Pending,
                   ) && " (Queued)"}
                 </span>
-                {activeOperation != null && (
+                {activeDirectInstallOperation != null && (
                   <div
                     style={{
                       marginLeft: "auto",
@@ -217,9 +222,11 @@ export default function FlavorTab({
                     }}
                   >
                     <ProgressBarWithInfo
-                      nProgress={activeOperation.progress}
-                      indeterminate={activeOperation.state === OperationState.Extracting}
-                      sOperationText={activeOperation.state}
+                      nProgress={activeDirectInstallOperation.progress}
+                      indeterminate={
+                        activeDirectInstallOperation.state === OperationState.Extracting
+                      }
+                      sOperationText={activeDirectInstallOperation.state}
                       bottomSeparator="none"
                     />
                   </div>
@@ -243,7 +250,7 @@ export default function FlavorTab({
                       showContextMenu(
                         <Menu label="Catalog Release Actions">
                           <MenuItem
-                            disabled={directInstallPresent}
+                            disabled={directInstallPresent || directInstallBusy}
                             onClick={() => {
                               installCatalogRelease(socket, release.id);
                             }}
@@ -304,4 +311,10 @@ export default function FlavorTab({
 
 function getToolLabel(tool: InstalledCompatibilityTool): string {
   return tool.user_label ?? tool.display_name;
+}
+
+function isDirectInstallOperation(operation: OperationInfo): boolean {
+  return (
+    operation.kind === OperationKind.Install && operation.virtual_tool_id == null
+  );
 }

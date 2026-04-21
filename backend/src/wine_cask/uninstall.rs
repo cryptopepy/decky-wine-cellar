@@ -6,11 +6,7 @@ use log::error;
 use std::path::PathBuf;
 
 impl WineCask {
-    pub async fn uninstall_installed_tool(
-        &self,
-        installed_tool_id: String,
-        peer_map: &PeerMap,
-    ) {
+    pub async fn uninstall_installed_tool(&self, installed_tool_id: String, peer_map: &PeerMap) {
         let Some(installed_tool) = self.get_installed_tool(&installed_tool_id).await else {
             self.broadcast_notification(peer_map, "Installed tool not found")
                 .await;

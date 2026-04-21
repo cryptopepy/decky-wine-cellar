@@ -5,7 +5,9 @@ mod wine_cask;
 
 use crate::multilogger::MultiLogger;
 use crate::steam_util::SteamUtil;
-use crate::wine_cask::app::{AppState, Command, MessageEnvelope, MessageType, UpdaterState, WineCask};
+use crate::wine_cask::app::{
+    AppState, Command, MessageEnvelope, MessageType, UpdaterState, WineCask,
+};
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
 use log::{error, info, warn, Level};
@@ -50,6 +52,7 @@ async fn main() -> Result<(), IoError> {
     let wine_cask = WineCask {
         steam_util,
         app_state,
+        operation_broadcast_cache: Arc::new(Mutex::new(None)),
         queue_notify: queue_notify.clone(),
         virtual_tool_manifest_path: get_virtual_tool_manifest_path(),
     };
@@ -244,7 +247,9 @@ async fn handle_request(wine_cask: &Arc<WineCask>, msg: &str, peer_map: &PeerMap
                         wine_cask.cancel_operation(operation_id, peer_map).await;
                     }
                     Command::CreateVirtualTool { user_label } => {
-                        wine_cask.queue_create_virtual_tool(user_label, peer_map).await;
+                        wine_cask
+                            .queue_create_virtual_tool(user_label, peer_map)
+                            .await;
                     }
                     Command::RenameVirtualTool {
                         virtual_tool_id,
@@ -257,7 +262,10 @@ async fn handle_request(wine_cask: &Arc<WineCask>, msg: &str, peer_map: &PeerMap
                 }
             } else {
                 wine_cask
-                    .broadcast_notification(peer_map, "Error: Command request missing command payload")
+                    .broadcast_notification(
+                        peer_map,
+                        "Error: Command request missing command payload",
+                    )
                     .await;
             }
         }

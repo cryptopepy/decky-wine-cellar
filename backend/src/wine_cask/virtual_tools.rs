@@ -153,8 +153,7 @@ impl WineCask {
             .steam_util
             .get_steam_compatibility_tools_directory()
             .join(&directory_name);
-        if let Err(err) =
-            rewrite_virtual_tool_vdf(&tool_dir, &steam_internal_name, &trimmed_label)
+        if let Err(err) = rewrite_virtual_tool_vdf(&tool_dir, &steam_internal_name, &trimmed_label)
         {
             warn!("Failed to refresh virtual tool VDF after rename: {}", err);
         }
@@ -182,7 +181,11 @@ impl WineCask {
 
     pub fn remove_virtual_tool_slot(&self, virtual_tool_id: &str) -> Result<String, String> {
         let mut manifest = self.load_virtual_tool_manifest();
-        let Some(position) = manifest.tools.iter().position(|tool| tool.id == virtual_tool_id) else {
+        let Some(position) = manifest
+            .tools
+            .iter()
+            .position(|tool| tool.id == virtual_tool_id)
+        else {
             return Err("Virtual tool not found".to_string());
         };
 

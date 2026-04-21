@@ -1,7 +1,7 @@
 use crate::steam_util::SteamUtil;
 use crate::wine_cask::flavors::{
-    CatalogRelease, CompatibilityToolFlavor, Flavor, InstalledCompatibilityTool, InstalledToolSource,
-    SteamClientCompatToolInfo, VirtualCompatibilityTool,
+    CatalogRelease, CompatibilityToolFlavor, Flavor, InstalledCompatibilityTool,
+    InstalledToolSource, SteamClientCompatToolInfo, VirtualCompatibilityTool,
 };
 use crate::PeerMap;
 use log::{debug, error, info, warn};
@@ -9,13 +9,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
 use tokio_tungstenite::tungstenite::Message;
+
+const DOWNLOAD_PROGRESS_BROADCAST_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct WineCask {
     pub steam_util: SteamUtil,
     pub app_state: Arc<Mutex<AppState>>,
+    pub operation_broadcast_cache: Arc<Mutex<Option<(OperationStateSnapshot, Instant)>>>,
     pub queue_notify: Arc<Notify>,
     pub virtual_tool_manifest_path: PathBuf,
 }
@@ -57,7 +60,7 @@ pub enum MessageType {
     Notification,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct OperationStateSnapshot {
     pub current_operation: Option<OperationInfo>,
     pub queued_operations: Vec<OperationInfo>,
@@ -120,7 +123,7 @@ pub enum OperationState {
     Cancelling,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct OperationInfo {
     pub id: String,
     pub label: String,
@@ -141,7 +144,9 @@ impl WineCask {
             .iter()
             .map(|queued| queued.operation.clone())
             .collect();
-        app_state.current_operation = next_operation.as_ref().map(|queued| queued.operation.clone());
+        app_state.current_operation = next_operation
+            .as_ref()
+            .map(|queued| queued.operation.clone());
         drop(app_state);
         self.broadcast_operation_state(peer_map).await;
         next_operation
@@ -160,8 +165,7 @@ impl WineCask {
     ) {
         let mut app_state = self.app_state.lock().await;
         if let Some(operation) = &mut app_state.current_operation {
-            if operation.state != OperationState::Cancelling
-                || state == OperationState::Cancelling
+            if operation.state != OperationState::Cancelling || state == OperationState::Cancelling
             {
                 operation.state = state;
             }
@@ -193,23 +197,6 @@ impl WineCask {
             return;
         };
 
-        if matches!(&target, InstallTarget::Direct)
-            && self
-                .app_state
-                .lock()
-                .await
-                .installed_tools
-                .iter()
-                .any(|tool| {
-                    matches!(tool.source, InstalledToolSource::Direct)
-                        && tool.catalog_release_id.as_deref() == Some(&release_id)
-                })
-        {
-            self.broadcast_notification(peer_map, "That release is already installed")
-                .await;
-            return;
-        }
-
         let (label, virtual_tool_id) = match &target {
             InstallTarget::Direct => (
                 format!("Install {}", catalog_release.release.tag_name),
@@ -231,6 +218,34 @@ impl WineCask {
             }
         };
 
+        let mut app_state = self.app_state.lock().await;
+        if matches!(&target, InstallTarget::Direct)
+            && app_state.installed_tools.iter().any(|tool| {
+                matches!(tool.source, InstalledToolSource::Direct)
+                    && tool.catalog_release_id.as_deref() == Some(catalog_release.id.as_str())
+            })
+        {
+            drop(app_state);
+            self.broadcast_notification(peer_map, "That release is already installed")
+                .await;
+            return;
+        }
+
+        if app_state
+            .current_operation
+            .as_ref()
+            .map(|operation| install_operation_matches_target(operation, &release_id, &target))
+            .unwrap_or(false)
+            || app_state.operation_queue.iter().any(|queued| {
+                install_operation_matches_target(&queued.operation, &release_id, &target)
+            })
+        {
+            drop(app_state);
+            self.broadcast_notification(peer_map, duplicate_install_notification_message(&target))
+                .await;
+            return;
+        }
+
         let queued_command = QueuedCommand {
             command: Command::InstallCatalogRelease { release_id, target },
             operation: OperationInfo {
@@ -245,8 +260,13 @@ impl WineCask {
             },
         };
 
-        self.app_state.lock().await.operation_queue.push_back(queued_command);
-        self.sync_public_queue_snapshot().await;
+        app_state.operation_queue.push_back(queued_command);
+        app_state.queued_operations = app_state
+            .operation_queue
+            .iter()
+            .map(|queued| queued.operation.clone())
+            .collect();
+        drop(app_state);
         self.queue_notify.notify_one();
         self.broadcast_operation_state(peer_map).await;
     }
@@ -281,7 +301,11 @@ impl WineCask {
             },
         };
 
-        self.app_state.lock().await.operation_queue.push_back(queued_command);
+        self.app_state
+            .lock()
+            .await
+            .operation_queue
+            .push_back(queued_command);
         self.sync_public_queue_snapshot().await;
         self.queue_notify.notify_one();
         self.broadcast_operation_state(peer_map).await;
@@ -311,7 +335,11 @@ impl WineCask {
             },
         };
 
-        self.app_state.lock().await.operation_queue.push_back(queued_command);
+        self.app_state
+            .lock()
+            .await
+            .operation_queue
+            .push_back(queued_command);
         self.sync_public_queue_snapshot().await;
         self.queue_notify.notify_one();
         self.broadcast_operation_state(peer_map).await;
@@ -353,7 +381,11 @@ impl WineCask {
             },
         };
 
-        self.app_state.lock().await.operation_queue.push_back(queued_command);
+        self.app_state
+            .lock()
+            .await
+            .operation_queue
+            .push_back(queued_command);
         self.sync_public_queue_snapshot().await;
         self.queue_notify.notify_one();
         self.broadcast_operation_state(peer_map).await;
@@ -429,19 +461,31 @@ impl WineCask {
     }
 
     pub async fn broadcast_operation_state(&self, peer_map: &PeerMap) {
-        let app_state = self.app_state.lock().await;
+        let snapshot = {
+            let app_state = self.app_state.lock().await;
+            OperationStateSnapshot {
+                current_operation: app_state.current_operation.clone(),
+                queued_operations: app_state.queued_operations.clone(),
+            }
+        };
+
+        let now = Instant::now();
+        let mut operation_broadcast_cache = self.operation_broadcast_cache.lock().await;
+        if should_skip_operation_broadcast(operation_broadcast_cache.as_ref(), &snapshot, now) {
+            return;
+        }
+
+        *operation_broadcast_cache = Some((snapshot.clone(), now));
+        drop(operation_broadcast_cache);
+
         let response_new = MessageEnvelope {
             r#type: MessageType::UpdateOperations,
             command: None,
             notification: None,
             steam_visible_tools: None,
             app_state: None,
-            operation_state: Some(OperationStateSnapshot {
-                current_operation: app_state.current_operation.clone(),
-                queued_operations: app_state.queued_operations.clone(),
-            }),
+            operation_state: Some(snapshot),
         };
-        drop(app_state);
         self.broadcast_message(peer_map, &response_new).await;
     }
 
@@ -564,16 +608,13 @@ impl WineCask {
 
         let mut installed_tools = self.list_compatibility_tools().unwrap_or_default();
         for installed_tool in &mut installed_tools {
-            installed_tool.requires_restart = !visible_tool_names.contains(&installed_tool.internal_name);
+            installed_tool.requires_restart =
+                !visible_tool_names.contains(&installed_tool.internal_name);
 
-            if let Some(virtual_tool_config) = virtual_manifest
-                .tools
-                .iter()
-                .find(|config| {
-                    config.directory_name == installed_tool.directory_name
-                        || config.steam_internal_name == installed_tool.internal_name
-                })
-            {
+            if let Some(virtual_tool_config) = virtual_manifest.tools.iter().find(|config| {
+                config.directory_name == installed_tool.directory_name
+                    || config.steam_internal_name == installed_tool.internal_name
+            }) {
                 installed_tool.source = InstalledToolSource::Virtual;
                 installed_tool.virtual_tool_id = Some(virtual_tool_config.id.clone());
                 installed_tool.user_label = Some(virtual_tool_config.user_label.clone());
@@ -614,8 +655,9 @@ impl WineCask {
                     .and_then(|release_id| catalog_lookup.get(release_id));
                 let github_release =
                     current_payload_release.map(|catalog_release| catalog_release.release.clone());
-                let current_payload_name =
-                    github_release.as_ref().map(|release| release.tag_name.clone());
+                let current_payload_name = github_release
+                    .as_ref()
+                    .map(|release| release.tag_name.clone());
                 let current_payload_flavor = current_payload_release
                     .map(|catalog_release| catalog_release.flavor.clone())
                     .unwrap_or(CompatibilityToolFlavor::Unknown);
@@ -626,7 +668,9 @@ impl WineCask {
                     steam_internal_name: virtual_tool_config.steam_internal_name.clone(),
                     directory_name: virtual_tool_config.directory_name.clone(),
                     installed_tool_id: installed_tool.map(|tool| tool.id.clone()),
-                    current_payload_release_id: virtual_tool_config.current_payload_release_id.clone(),
+                    current_payload_release_id: virtual_tool_config
+                        .current_payload_release_id
+                        .clone(),
                     current_payload_name,
                     current_payload_flavor,
                     github_release,
@@ -665,7 +709,10 @@ impl WineCask {
             .cloned()
     }
 
-    pub async fn get_installed_tool(&self, installed_tool_id: &str) -> Option<InstalledCompatibilityTool> {
+    pub async fn get_installed_tool(
+        &self,
+        installed_tool_id: &str,
+    ) -> Option<InstalledCompatibilityTool> {
         self.app_state
             .lock()
             .await
@@ -675,7 +722,10 @@ impl WineCask {
             .cloned()
     }
 
-    pub async fn get_virtual_tool(&self, virtual_tool_id: &str) -> Option<VirtualCompatibilityTool> {
+    pub async fn get_virtual_tool(
+        &self,
+        virtual_tool_id: &str,
+    ) -> Option<VirtualCompatibilityTool> {
         self.app_state
             .lock()
             .await
@@ -727,8 +777,175 @@ fn find_catalog_release_for_tool(
     })
 }
 
-fn apply_catalog_release(installed_tool: &mut InstalledCompatibilityTool, catalog_release: &CatalogRelease) {
+fn apply_catalog_release(
+    installed_tool: &mut InstalledCompatibilityTool,
+    catalog_release: &CatalogRelease,
+) {
     installed_tool.flavor = catalog_release.flavor.clone();
     installed_tool.catalog_release_id = Some(catalog_release.id.clone());
     installed_tool.github_release = Some(catalog_release.release.clone());
+}
+
+fn install_operation_matches_target(
+    operation: &OperationInfo,
+    release_id: &str,
+    target: &InstallTarget,
+) -> bool {
+    operation.kind == OperationKind::Install
+        && operation.release_id.as_deref() == Some(release_id)
+        && match target {
+            InstallTarget::Direct => operation.virtual_tool_id.is_none(),
+            InstallTarget::VirtualTool { virtual_tool_id } => {
+                operation.virtual_tool_id.as_deref() == Some(virtual_tool_id)
+            }
+        }
+}
+
+fn duplicate_install_notification_message(target: &InstallTarget) -> &'static str {
+    match target {
+        InstallTarget::Direct => "That release is already queued or installing",
+        InstallTarget::VirtualTool { .. } => "That release is already queued for that virtual tool",
+    }
+}
+
+fn should_skip_operation_broadcast(
+    last_broadcast: Option<&(OperationStateSnapshot, Instant)>,
+    next_snapshot: &OperationStateSnapshot,
+    now: Instant,
+) -> bool {
+    let Some((last_snapshot, last_sent_at)) = last_broadcast else {
+        return false;
+    };
+
+    if last_snapshot == next_snapshot {
+        return true;
+    }
+
+    is_download_progress_update_throttled(
+        last_snapshot,
+        next_snapshot,
+        now.duration_since(*last_sent_at),
+    )
+}
+
+fn is_download_progress_update_throttled(
+    last_snapshot: &OperationStateSnapshot,
+    next_snapshot: &OperationStateSnapshot,
+    elapsed_since_last_broadcast: Duration,
+) -> bool {
+    if elapsed_since_last_broadcast >= DOWNLOAD_PROGRESS_BROADCAST_INTERVAL {
+        return false;
+    }
+
+    if last_snapshot.queued_operations != next_snapshot.queued_operations {
+        return false;
+    }
+
+    let (Some(last_operation), Some(next_operation)) = (
+        last_snapshot.current_operation.as_ref(),
+        next_snapshot.current_operation.as_ref(),
+    ) else {
+        return false;
+    };
+
+    last_operation.id == next_operation.id
+        && last_operation.kind == next_operation.kind
+        && last_operation.state == OperationState::Downloading
+        && next_operation.state == OperationState::Downloading
+        && next_operation.progress < 100
+        && last_operation.progress != next_operation.progress
+        && last_operation.label == next_operation.label
+        && last_operation.release_id == next_operation.release_id
+        && last_operation.installed_tool_id == next_operation.installed_tool_id
+        && last_operation.virtual_tool_id == next_operation.virtual_tool_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operation(state: OperationState, progress: u8) -> OperationInfo {
+        OperationInfo {
+            id: "operation-1".to_string(),
+            label: "Install GE-Proton".to_string(),
+            kind: OperationKind::Install,
+            state,
+            progress,
+            release_id: Some("release-1".to_string()),
+            installed_tool_id: None,
+            virtual_tool_id: None,
+        }
+    }
+
+    fn snapshot(state: OperationState, progress: u8) -> OperationStateSnapshot {
+        OperationStateSnapshot {
+            current_operation: Some(operation(state, progress)),
+            queued_operations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn skips_identical_operation_snapshots() {
+        let now = Instant::now();
+        let current_snapshot = snapshot(OperationState::Downloading, 37);
+        let last_broadcast = (current_snapshot.clone(), now);
+
+        assert!(should_skip_operation_broadcast(
+            Some(&last_broadcast),
+            &current_snapshot,
+            now + Duration::from_millis(50),
+        ));
+    }
+
+    #[test]
+    fn throttles_rapid_download_progress_updates() {
+        let now = Instant::now();
+        let last_broadcast = (snapshot(OperationState::Downloading, 37), now);
+        let next_snapshot = snapshot(OperationState::Downloading, 38);
+
+        assert!(should_skip_operation_broadcast(
+            Some(&last_broadcast),
+            &next_snapshot,
+            now + Duration::from_millis(50),
+        ));
+    }
+
+    #[test]
+    fn allows_download_progress_updates_after_throttle_window() {
+        let now = Instant::now();
+        let last_broadcast = (snapshot(OperationState::Downloading, 37), now);
+        let next_snapshot = snapshot(OperationState::Downloading, 38);
+
+        assert!(!should_skip_operation_broadcast(
+            Some(&last_broadcast),
+            &next_snapshot,
+            now + DOWNLOAD_PROGRESS_BROADCAST_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn allows_immediate_state_transitions() {
+        let now = Instant::now();
+        let last_broadcast = (snapshot(OperationState::Downloading, 99), now);
+        let next_snapshot = snapshot(OperationState::Extracting, 0);
+
+        assert!(!should_skip_operation_broadcast(
+            Some(&last_broadcast),
+            &next_snapshot,
+            now + Duration::from_millis(50),
+        ));
+    }
+
+    #[test]
+    fn allows_completion_progress_immediately() {
+        let now = Instant::now();
+        let last_broadcast = (snapshot(OperationState::Downloading, 99), now);
+        let next_snapshot = snapshot(OperationState::Downloading, 100);
+
+        assert!(!should_skip_operation_broadcast(
+            Some(&last_broadcast),
+            &next_snapshot,
+            now + Duration::from_millis(50),
+        ));
+    }
 }

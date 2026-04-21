@@ -49,7 +49,9 @@ impl WineCask {
             target: target.clone(),
         };
 
-        let Some(download_plan) = look_for_compressed_archive(&install_plan.catalog_release.release) else {
+        let Some(download_plan) =
+            look_for_compressed_archive(&install_plan.catalog_release.release)
+        else {
             self.broadcast_notification(
                 peer_map,
                 "Error: No supported compressed archive found for this release",
@@ -290,14 +292,16 @@ impl WineCask {
             | CompatibilityToolFlavor::Boxtron => {
                 let new_folder_name = format!(
                     "{}{}",
-                    install_plan.catalog_release.flavor, install_plan.catalog_release.release.tag_name
+                    install_plan.catalog_release.flavor,
+                    install_plan.catalog_release.release.tag_name
                 );
                 generate_compatibility_tool_vdf(
                     extracted_directory.join("compatibilitytool.vdf"),
                     &new_folder_name,
                     &format!(
                         "{} {}",
-                        install_plan.catalog_release.flavor, install_plan.catalog_release.release.tag_name
+                        install_plan.catalog_release.flavor,
+                        install_plan.catalog_release.release.tag_name
                     ),
                 );
                 temp_dir.join(&new_folder_name)
@@ -337,7 +341,11 @@ impl WineCask {
         virtual_tool_id: &str,
     ) -> Result<String, String> {
         let manifest = self.load_virtual_tool_manifest();
-        let Some(virtual_tool) = manifest.tools.iter().find(|tool| tool.id == virtual_tool_id) else {
+        let Some(virtual_tool) = manifest
+            .tools
+            .iter()
+            .find(|tool| tool.id == virtual_tool_id)
+        else {
             return Err("Virtual compatibility tool no longer exists".to_string());
         };
 
