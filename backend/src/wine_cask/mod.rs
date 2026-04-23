@@ -34,29 +34,6 @@ pub fn generate_compatibility_tool_vdf(path: PathBuf, internal_name: &str, displ
     .expect("Failed to write to file");
 }
 
-fn copy_dir(source: &Path, destination: &Path) -> io::Result<()> {
-    if !destination.exists() {
-        fs::create_dir_all(destination)?;
-    }
-
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let entry_path = entry.path();
-        let file_name = entry_path
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing filename"))?;
-        let destination_path = destination.join(file_name);
-
-        if entry_path.is_dir() {
-            copy_dir(&entry_path, &destination_path)?;
-        } else {
-            fs::copy(&entry_path, &destination_path)?;
-        }
-    }
-
-    Ok(())
-}
-
 fn recursive_delete_dir_entry(entry_path: &Path) -> io::Result<()> {
     if entry_path.is_dir() {
         for entry in fs::read_dir(entry_path)? {
@@ -133,6 +110,12 @@ pub async fn process_queue(wine_cask: Arc<WineCask>, peer_map: PeerMap) {
                             wine_cask.broadcast_notification(&peer_map, &err).await;
                         }
                     }
+                }
+                Command::RemoveVirtualTool { virtual_tool_id } => {
+                    wine_cask
+                        .update_current_operation(OperationState::Running, 0, &peer_map)
+                        .await;
+                    wine_cask.remove_virtual_tool(virtual_tool_id, &peer_map).await;
                 }
                 Command::RefreshCatalog | Command::CancelOperation { .. } => {}
             }

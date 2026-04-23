@@ -1,8 +1,11 @@
 use crate::wine_cask::app::WineCask;
 use crate::wine_cask::generate_compatibility_tool_vdf;
+use crate::wine_cask::recursive_delete_dir_entry;
+use crate::PeerMap;
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use std::fs::create_dir_all;
+use std::path::Path;
 use std::{fs, io};
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -193,6 +196,50 @@ impl WineCask {
         self.save_virtual_tool_manifest(&manifest)?;
         Ok(removed_tool.user_label)
     }
+
+    pub async fn remove_virtual_tool(
+        &self,
+        virtual_tool_id: String,
+        peer_map: &PeerMap,
+    ) {
+        let Some(virtual_tool) = self.get_virtual_tool(&virtual_tool_id).await else {
+            self.broadcast_notification(peer_map, "Virtual tool not found")
+                .await;
+            return;
+        };
+
+        let tool_dir = self
+            .steam_util
+            .get_steam_compatibility_tools_directory()
+            .join(&virtual_tool.directory_name);
+
+        if let Err(err) = remove_virtual_tool_directory(
+            &self.steam_util.get_steam_compatibility_tools_directory(),
+            &tool_dir,
+        ) {
+            error!("{}", err);
+            self.broadcast_notification(peer_map, &err).await;
+            return;
+        }
+
+        if let Err(err) = self.remove_virtual_tool_slot(&virtual_tool_id) {
+            let error_message = format!(
+                "Compatibility tool directory removed but virtual tool manifest update failed: {}",
+                err
+            );
+            error!("{}", error_message);
+            self.broadcast_notification(peer_map, &error_message).await;
+            return;
+        }
+
+        self.sync_backend_state().await;
+        self.broadcast_app_state(peer_map).await;
+        self.broadcast_notification(
+            peer_map,
+            &format!("Removed virtual compatibility tool: {}", virtual_tool.user_label),
+        )
+        .await;
+    }
 }
 
 fn rewrite_virtual_tool_vdf(
@@ -207,4 +254,24 @@ fn rewrite_virtual_tool_vdf(
         user_label,
     );
     Ok(())
+}
+
+fn remove_virtual_tool_directory(base_dir: &Path, tool_dir: &Path) -> Result<(), String> {
+    if !tool_dir.exists() {
+        return Ok(());
+    }
+
+    let canonical_base = base_dir
+        .canonicalize()
+        .map_err(|err| format!("Failed to access compatibility tools base directory: {}", err))?;
+    let canonical_target = tool_dir
+        .canonicalize()
+        .map_err(|err| format!("Failed to access virtual tool directory: {}", err))?;
+
+    if !canonical_target.starts_with(&canonical_base) {
+        return Err("Refusing to remove path outside compatibilitytools.d".to_string());
+    }
+
+    recursive_delete_dir_entry(&canonical_target)
+        .map_err(|err| format!("Error removing virtual compatibility tool: {}", err))
 }

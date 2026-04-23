@@ -97,6 +97,9 @@ pub enum Command {
         virtual_tool_id: String,
         user_label: String,
     },
+    RemoveVirtualTool {
+        virtual_tool_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -112,6 +115,7 @@ pub enum OperationKind {
     Uninstall,
     CreateVirtualTool,
     RenameVirtualTool,
+    RemoveVirtualTool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -376,6 +380,64 @@ impl WineCask {
                 state: OperationState::Pending,
                 progress: 0,
                 release_id: None,
+                installed_tool_id: virtual_tool.installed_tool_id.clone(),
+                virtual_tool_id: Some(virtual_tool_id),
+            },
+        };
+
+        self.app_state
+            .lock()
+            .await
+            .operation_queue
+            .push_back(queued_command);
+        self.sync_public_queue_snapshot().await;
+        self.queue_notify.notify_one();
+        self.broadcast_operation_state(peer_map).await;
+    }
+
+    pub async fn queue_remove_virtual_tool(
+        &self,
+        virtual_tool_id: String,
+        peer_map: &PeerMap,
+    ) {
+        let Some(virtual_tool) = self.get_virtual_tool(&virtual_tool_id).await else {
+            self.broadcast_notification(peer_map, "Unknown virtual tool requested")
+                .await;
+            return;
+        };
+
+        let app_state = self.app_state.lock().await;
+        if app_state
+            .current_operation
+            .as_ref()
+            .map(|operation| operation_targets_virtual_tool(operation, &virtual_tool_id))
+            .unwrap_or(false)
+            || app_state
+                .operation_queue
+                .iter()
+                .any(|queued| operation_targets_virtual_tool(&queued.operation, &virtual_tool_id))
+        {
+            drop(app_state);
+            self.broadcast_notification(
+                peer_map,
+                "That virtual tool already has an active or queued operation",
+            )
+            .await;
+            return;
+        }
+        drop(app_state);
+
+        let queued_command = QueuedCommand {
+            command: Command::RemoveVirtualTool {
+                virtual_tool_id: virtual_tool_id.clone(),
+            },
+            operation: OperationInfo {
+                id: operation_id(),
+                label: format!("Remove {}", virtual_tool.user_label),
+                kind: OperationKind::RemoveVirtualTool,
+                state: OperationState::Pending,
+                progress: 0,
+                release_id: virtual_tool.current_payload_release_id.clone(),
                 installed_tool_id: virtual_tool.installed_tool_id.clone(),
                 virtual_tool_id: Some(virtual_tool_id),
             },
@@ -806,6 +868,10 @@ fn duplicate_install_notification_message(target: &InstallTarget) -> &'static st
         InstallTarget::Direct => "That release is already queued or installing",
         InstallTarget::VirtualTool { .. } => "That release is already queued for that virtual tool",
     }
+}
+
+fn operation_targets_virtual_tool(operation: &OperationInfo, virtual_tool_id: &str) -> bool {
+    operation.virtual_tool_id.as_deref() == Some(virtual_tool_id)
 }
 
 fn should_skip_operation_broadcast(

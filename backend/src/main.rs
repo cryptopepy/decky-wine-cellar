@@ -259,6 +259,11 @@ async fn handle_request(wine_cask: &Arc<WineCask>, msg: &str, peer_map: &PeerMap
                             .queue_rename_virtual_tool(virtual_tool_id, user_label, peer_map)
                             .await;
                     }
+                    Command::RemoveVirtualTool { virtual_tool_id } => {
+                        wine_cask
+                            .queue_remove_virtual_tool(virtual_tool_id, peer_map)
+                            .await;
+                    }
                 }
             } else {
                 wine_cask

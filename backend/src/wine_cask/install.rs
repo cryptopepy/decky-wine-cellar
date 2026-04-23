@@ -1,7 +1,7 @@
 use crate::github_util::{Asset, Release};
 use crate::wine_cask::app::{InstallTarget, OperationState, WineCask};
 use crate::wine_cask::flavors::{CatalogRelease, CompatibilityToolFlavor};
-use crate::wine_cask::{copy_dir, generate_compatibility_tool_vdf, recursive_delete_dir_entry};
+use crate::wine_cask::{generate_compatibility_tool_vdf, recursive_delete_dir_entry};
 use crate::PeerMap;
 use flate2::bufread::GzDecoder;
 use futures_util::StreamExt;
@@ -264,14 +264,12 @@ impl WineCask {
             return Err("Installation cancelled".to_string());
         }
 
-        let install_result = match &install_plan.target {
+        match &install_plan.target {
             InstallTarget::Direct => self.install_direct_tool(&extracted_directory, install_plan),
             InstallTarget::VirtualTool { virtual_tool_id } => {
                 self.install_virtual_tool(&extracted_directory, install_plan, virtual_tool_id)
             }
-        };
-
-        install_result
+        }
     }
 
     fn install_direct_tool(
@@ -321,9 +319,16 @@ impl WineCask {
             .ok_or_else(|| "Failed to resolve extracted compatibility tool name".to_string())?;
         let target_directory = compatibility_tools_directory.join(target_directory_name);
 
-        copy_dir(&new_path, &target_directory).map_err(|err| {
+        if target_directory.exists() {
+            return Err(format!(
+                "Compatibility tool directory already exists: {}",
+                target_directory.display()
+            ));
+        }
+
+        std::fs::rename(&new_path, &target_directory).map_err(|err| {
             format!(
-                "Failed to copy compatibility tool into Steam compatibilitytools.d: {}",
+                "Failed to move compatibility tool into Steam compatibilitytools.d: {}",
                 err
             )
         })?;
@@ -359,10 +364,8 @@ impl WineCask {
                 .map_err(|err| format!("Failed to replace virtual tool contents: {}", err))?;
         }
 
-        create_dir_all(&target_directory)
-            .map_err(|err| format!("Failed to recreate virtual tool directory: {}", err))?;
-        copy_dir(extracted_directory, &target_directory)
-            .map_err(|err| format!("Failed to copy virtual tool contents: {}", err))?;
+        std::fs::rename(extracted_directory, &target_directory)
+            .map_err(|err| format!("Failed to move virtual tool contents into place: {}", err))?;
         generate_compatibility_tool_vdf(
             target_directory.join("compatibilitytool.vdf"),
             &virtual_tool.steam_internal_name,

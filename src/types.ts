@@ -78,6 +78,7 @@ export enum OperationKind {
   Uninstall = "Uninstall",
   CreateVirtualTool = "CreateVirtualTool",
   RenameVirtualTool = "RenameVirtualTool",
+  RemoveVirtualTool = "RemoveVirtualTool",
 }
 
 export enum OperationState {
@@ -135,6 +136,7 @@ export enum CommandType {
   CancelOperation = "CancelOperation",
   CreateVirtualTool = "CreateVirtualTool",
   RenameVirtualTool = "RenameVirtualTool",
+  RemoveVirtualTool = "RemoveVirtualTool",
 }
 
 export type Command =
@@ -162,6 +164,10 @@ export type Command =
       type: CommandType.RenameVirtualTool;
       virtual_tool_id: string;
       user_label: string;
+    }
+  | {
+      type: CommandType.RemoveVirtualTool;
+      virtual_tool_id: string;
     };
 
 export enum MessageType {

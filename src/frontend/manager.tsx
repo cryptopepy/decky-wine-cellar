@@ -22,6 +22,7 @@ import {
 } from "../types";
 import {
   createVirtualTool,
+  removeVirtualTool,
   renameVirtualTool,
   uninstallInstalledTool,
 } from "../utils/backendApi";
@@ -37,6 +38,10 @@ export default function ManagerTab({
   const directInstalledTools = appState.installed_tools.filter(
     (tool) => tool.source !== InstalledToolSource.Virtual,
   );
+  const operations = [
+    ...(appState.current_operation != null ? [appState.current_operation] : []),
+    ...appState.queued_operations,
+  ];
 
   const showCreateVirtualToolModal = () =>
     showTextPromptModal({
@@ -81,11 +86,12 @@ export default function ManagerTab({
     );
 
   const handleRemoveVirtualTool = (virtualTool: VirtualCompatibilityTool) => {
-    if (virtualTool.installed_tool_id == null) {
+    if (virtualTool.installed_tool_id != null) {
+      uninstallInstalledTool(socket, virtualTool.installed_tool_id);
       return;
     }
 
-    uninstallInstalledTool(socket, virtualTool.installed_tool_id);
+    removeVirtualTool(socket, virtualTool.id);
   };
 
   const handleRemoveVirtualToolModal = (virtualTool: VirtualCompatibilityTool) =>
@@ -127,99 +133,106 @@ export default function ManagerTab({
           </div>
         ) : (
           <ul style={{ listStyleType: "none" }}>
-            {appState.virtual_tools.map((virtualTool) => (
-              <li
-                key={virtualTool.id}
-                style={{
-                  display: "flex",
-                  flexDirection: "row",
-                  alignItems: "center",
-                  paddingBottom: "10px",
-                }}
-              >
-                <span>
-                  {virtualTool.user_label}
-                  {virtualTool.current_payload_name != null &&
-                    " (" + virtualTool.current_payload_name + ")"}
-                  {virtualTool.current_payload_name == null && " (Empty)"}
-                  {virtualTool.requires_restart && " (Requires Restart)"}
-                  {virtualTool.used_by_games.length !== 0 && " (Used By Games)"}
-                </span>
-                <Focusable
+            {appState.virtual_tools.map((virtualTool) => {
+              const slotBusy = operations.some(
+                (operation) => operation.virtual_tool_id === virtualTool.id,
+              );
+
+              return (
+                <li
+                  key={virtualTool.id}
                   style={{
-                    marginLeft: "auto",
-                    boxShadow: "none",
                     display: "flex",
-                    justifyContent: "right",
+                    flexDirection: "row",
+                    alignItems: "center",
+                    paddingBottom: "10px",
                   }}
                 >
-                  <DialogButton
+                  <span>
+                    {virtualTool.user_label}
+                    {virtualTool.current_payload_name != null &&
+                      " (" + virtualTool.current_payload_name + ")"}
+                    {virtualTool.current_payload_name == null && " (Empty)"}
+                    {virtualTool.requires_restart && " (Requires Restart)"}
+                    {virtualTool.used_by_games.length !== 0 && " (Used By Games)"}
+                  </span>
+                  <Focusable
                     style={{
-                      height: "40px",
-                      width: "40px",
-                      padding: "10px 12px",
-                      minWidth: "40px",
+                      marginLeft: "auto",
+                      boxShadow: "none",
+                      display: "flex",
+                      justifyContent: "right",
                     }}
-                    onClick={(event: MouseEvent) =>
-                      showContextMenu(
-                        <Menu label="Virtual Tool Actions">
-                          <MenuItem
-                            onClick={() => {
-                              showRenameVirtualToolModal(virtualTool);
-                            }}
-                          >
-                            Rename
-                          </MenuItem>
-                          <MenuItem
-                            disabled={virtualTool.installed_tool_id == null}
-                            onClick={() => {
-                              handleRemoveVirtualToolModal(virtualTool);
-                            }}
-                          >
-                            Remove
-                          </MenuItem>
-                          {virtualTool.used_by_games.length !== 0 && (
-                            <MenuItem
-                              onClick={() => {
-                                handleViewUsedByGames(
-                                  virtualTool.user_label,
-                                  virtualTool.used_by_games,
-                                );
-                              }}
-                            >
-                              View Used By Games
-                            </MenuItem>
-                          )}
-                          {virtualTool.github_release != null && (
-                            <MenuItem
-                              onClick={() => {
-                                if (virtualTool.github_release != null) {
-                                  handleViewChangeLog(virtualTool.github_release);
-                                }
-                              }}
-                            >
-                              View Current Payload Change Log
-                            </MenuItem>
-                          )}
-                          {virtualTool.requires_restart && (
-                            <MenuItem
-                              onClick={() => {
-                                RestartSteamClient();
-                              }}
-                            >
-                              Restart Steam
-                            </MenuItem>
-                          )}
-                        </Menu>,
-                        event.currentTarget ?? window,
-                      )
-                    }
                   >
-                    <FaEllipsisH />
-                  </DialogButton>
-                </Focusable>
-              </li>
-            ))}
+                    <DialogButton
+                      style={{
+                        height: "40px",
+                        width: "40px",
+                        padding: "10px 12px",
+                        minWidth: "40px",
+                      }}
+                      onClick={(event: MouseEvent) =>
+                        showContextMenu(
+                          <Menu label="Virtual Tool Actions">
+                            <MenuItem
+                              disabled={slotBusy}
+                              onClick={() => {
+                                showRenameVirtualToolModal(virtualTool);
+                              }}
+                            >
+                              Rename
+                            </MenuItem>
+                            <MenuItem
+                              disabled={slotBusy}
+                              onClick={() => {
+                                handleRemoveVirtualToolModal(virtualTool);
+                              }}
+                            >
+                              Remove
+                            </MenuItem>
+                            {virtualTool.used_by_games.length !== 0 && (
+                              <MenuItem
+                                onClick={() => {
+                                  handleViewUsedByGames(
+                                    virtualTool.user_label,
+                                    virtualTool.used_by_games,
+                                  );
+                                }}
+                              >
+                                View Used By Games
+                              </MenuItem>
+                            )}
+                            {virtualTool.github_release != null && (
+                              <MenuItem
+                                onClick={() => {
+                                  if (virtualTool.github_release != null) {
+                                    handleViewChangeLog(virtualTool.github_release);
+                                  }
+                                }}
+                              >
+                                View Current Payload Change Log
+                              </MenuItem>
+                            )}
+                            {virtualTool.requires_restart && (
+                              <MenuItem
+                                onClick={() => {
+                                  RestartSteamClient();
+                                }}
+                              >
+                                Restart Steam
+                              </MenuItem>
+                            )}
+                          </Menu>,
+                          event.currentTarget ?? window,
+                        )
+                      }
+                    >
+                      <FaEllipsisH />
+                    </DialogButton>
+                  </Focusable>
+                </li>
+              );
+            })}
           </ul>
         )}
       </DialogControlsSection>

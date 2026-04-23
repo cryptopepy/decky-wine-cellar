@@ -13,50 +13,76 @@ export default function ManagePage() {
   const [socket, setSocket] = useState<WebSocket>();
 
   useEffect(() => {
-    const websocket = new WebSocket("ws://localhost:8887");
-    const uniqueId = uuidv4();
+    let isDisposed = false;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | undefined;
+    let activeSocket: WebSocket | undefined;
 
-    setSocket(websocket);
-
-    websocket.onopen = async () => {
-      log("WebSocket connection established. Unique Identifier:", uniqueId);
-      requestState(websocket);
-      await reportSteamVisibleTools(websocket);
-    };
-
-    websocket.onmessage = (event) => {
-      const response: MessageEnvelope = JSON.parse(event.data);
-      if (response.type === MessageType.UpdateState && response.app_state != null) {
-        setAppState(response.app_state);
-        log("Received app state update");
-      } else if (
-        response.type === MessageType.UpdateOperations &&
-        response.operation_state != null
-      ) {
-        setAppState((currentState) => {
-          if (currentState == null) {
-            return currentState;
-          }
-
-          return {
-            ...currentState,
-            current_operation: response.operation_state?.current_operation,
-            queued_operations: response.operation_state?.queued_operations ?? [],
-          };
-        });
+    const connect = () => {
+      if (isDisposed) {
+        return;
       }
+
+      const websocket = new WebSocket("ws://localhost:8887");
+      const uniqueId = uuidv4();
+      activeSocket = websocket;
+
+      websocket.onopen = async () => {
+        setSocket(websocket);
+        log("WebSocket connection established. Unique Identifier:", uniqueId);
+        requestState(websocket);
+        await reportSteamVisibleTools(websocket);
+      };
+
+      websocket.onmessage = (event) => {
+        const response: MessageEnvelope = JSON.parse(event.data);
+        if (response.type === MessageType.UpdateState && response.app_state != null) {
+          setAppState(response.app_state);
+          log("Received app state update");
+        } else if (
+          response.type === MessageType.UpdateOperations &&
+          response.operation_state != null
+        ) {
+          setAppState((currentState) => {
+            if (currentState == null) {
+              return currentState;
+            }
+
+            return {
+              ...currentState,
+              current_operation: response.operation_state?.current_operation,
+              queued_operations: response.operation_state?.queued_operations ?? [],
+            };
+          });
+        }
+      };
+
+      websocket.onerror = (error) => {
+        log("WebSocket error:", error);
+      };
+
+      websocket.onclose = () => {
+        log("WebSocket connection closed. Unique Identifier:", uniqueId);
+        if (activeSocket === websocket) {
+          activeSocket = undefined;
+          setSocket(undefined);
+        }
+
+        if (!isDisposed) {
+          reconnectTimeout = setTimeout(() => {
+            connect();
+          }, 2000);
+        }
+      };
     };
 
-    websocket.onerror = (error) => {
-      log("WebSocket error:", error);
-    };
-
-    websocket.onclose = () => {
-      log("WebSocket connection closed. Unique Identifier:", uniqueId);
-    };
+    connect();
 
     return () => {
-      websocket.close();
+      isDisposed = true;
+      if (reconnectTimeout != null) {
+        clearTimeout(reconnectTimeout);
+      }
+      activeSocket?.close();
     };
   }, []);
 

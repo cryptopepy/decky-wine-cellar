@@ -295,17 +295,17 @@ impl SteamUtil {
         let mut library_folders: Vec<PathBuf> = Vec::new();
 
         for value in app_state_obj.values() {
-            let key_obj = value.first().and_then(|o| o.get_obj()).ok_or_else(|| {
-                SteamUtilError::VdfMissingEntry("Fail to retrieve entry object".to_string())
-            })?;
-            let path = key_obj
+            let Some(key_obj) = value.first().and_then(|o| o.get_obj()) else {
+                continue;
+            };
+            let Some(path) = key_obj
                 .get("path")
                 .and_then(|o| o.first())
                 .and_then(|o| o.get_str())
-                .ok_or_else(|| {
-                    SteamUtilError::VdfMissingEntry("Fail to retrieve path".to_string())
-                })?
-                .to_string();
+                .map(|path| path.to_string())
+            else {
+                continue;
+            };
             if !path.is_empty() {
                 library_folders.push(PathBuf::from(path));
             }
@@ -587,5 +587,33 @@ mod tests {
         assert_eq!(games.len(), 1);
         assert_eq!(games[0].app_id, 123456);
         assert_eq!(games[0].name, "Sample Game");
+    }
+
+    #[test]
+    fn test_list_library_folders_ignores_metadata_entries() {
+        let steam_dir = create_test_steam_directory();
+        let steam_root = steam_dir.path().join("root");
+        fs::write(
+            steam_root.join("steamapps").join("libraryfolders.vdf"),
+            format!(
+                r#""libraryfolders"
+            {{
+                "contentstatsid" "1234567890"
+                "0"
+                {{
+                    "path" "{}"
+                }}
+            }}"#,
+                steam_root.display()
+            ),
+        )
+        .expect("Failed to write library folders vdf");
+
+        let steam_util = SteamUtil::new(steam_root.clone());
+        let library_folders = steam_util
+            .list_library_folders()
+            .expect("Failed to list library folders");
+
+        assert_eq!(library_folders, vec![steam_root]);
     }
 }

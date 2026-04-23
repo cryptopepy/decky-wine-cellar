@@ -104,3 +104,13 @@ export function renameVirtualTool(
     user_label: userLabel,
   });
 }
+
+export function removeVirtualTool(
+  socket: WebSocket,
+  virtualToolId: string,
+): void {
+  sendCommand(socket, {
+    type: CommandType.RemoveVirtualTool,
+    virtual_tool_id: virtualToolId,
+  });
+}
