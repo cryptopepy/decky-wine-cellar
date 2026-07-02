@@ -19,7 +19,7 @@ struct InstallPlan {
     target: InstallTarget,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum CompressionType {
     Gzip,
     Xz,
@@ -451,16 +451,22 @@ fn cleanup_temp_directory(temp_dir: &Path) {
 
 fn look_for_compressed_archive(release: &Release) -> Option<DownloadPlan> {
     let is_supported_archive = |asset: &Asset| {
+        let name = asset.name.to_ascii_lowercase();
         asset.content_type == "application/gzip"
             || asset.content_type == "application/x-xz"
-            || asset.name.ends_with(".tar.gz")
-            || asset.name.ends_with(".tar.xz")
+            || name.ends_with(".tar.gz")
+            || name.ends_with(".tar.xz")
     };
 
     let compression_type = |asset: &Asset| {
-        if asset.content_type == "application/gzip" || asset.name.ends_with(".tar.gz") {
+        let name = asset.name.to_ascii_lowercase();
+        if name.ends_with(".tar.gz") {
             CompressionType::Gzip
-        } else if asset.content_type == "application/x-xz" || asset.name.ends_with(".tar.xz") {
+        } else if name.ends_with(".tar.xz") {
+            CompressionType::Xz
+        } else if asset.content_type == "application/gzip" {
+            CompressionType::Gzip
+        } else if asset.content_type == "application/x-xz" {
             CompressionType::Xz
         } else {
             CompressionType::Unknown
@@ -470,9 +476,95 @@ fn look_for_compressed_archive(release: &Release) -> Option<DownloadPlan> {
     release
         .assets
         .iter()
-        .find(|asset| is_supported_archive(asset))
+        .filter(|asset| is_supported_archive(asset))
+        .filter(|asset| is_steam_deck_archive(asset))
         .map(|asset| DownloadPlan {
             url: asset.browser_download_url.clone(),
             compression_type: compression_type(asset),
         })
+        .next()
+}
+
+fn is_steam_deck_archive(asset: &Asset) -> bool {
+    let name = asset.name.to_ascii_lowercase();
+    ![
+        "aarch64", "arm64", "armv7", "armhf", "riscv64", "ppc64", "s390x", "loong64",
+    ]
+    .iter()
+    .any(|arch| name.contains(arch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_selection_skips_aarch64_build_when_generic_build_exists() {
+        let release = release_with_assets(vec![
+            asset(
+                "GE-Proton11-1-aarch64.tar.gz",
+                "https://example.com/aarch64",
+            ),
+            asset("GE-Proton11-1.tar.gz", "https://example.com/x86_64"),
+        ]);
+
+        let plan = look_for_compressed_archive(&release).expect("Expected x86-compatible archive");
+
+        assert_eq!(plan.url, "https://example.com/x86_64");
+        assert_eq!(plan.compression_type, CompressionType::Gzip);
+    }
+
+    #[test]
+    fn archive_selection_rejects_release_with_only_aarch64_build() {
+        let release = release_with_assets(vec![asset(
+            "GE-Proton11-1-aarch64.tar.gz",
+            "https://example.com/aarch64",
+        )]);
+
+        assert!(look_for_compressed_archive(&release).is_none());
+    }
+
+    #[test]
+    fn archive_selection_accepts_explicit_x86_64_build() {
+        let release = release_with_assets(vec![asset(
+            "proton-cachyos-10-x86_64_v3.tar.xz",
+            "https://example.com/x86_64_v3",
+        )]);
+
+        let plan = look_for_compressed_archive(&release).expect("Expected x86_64 archive");
+
+        assert_eq!(plan.url, "https://example.com/x86_64_v3");
+        assert_eq!(plan.compression_type, CompressionType::Xz);
+    }
+
+    fn release_with_assets(assets: Vec<Asset>) -> Release {
+        Release {
+            url: "https://example.com/release".to_string(),
+            id: 1,
+            draft: false,
+            prerelease: false,
+            name: "Release".to_string(),
+            tag_name: "Release".to_string(),
+            assets,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            published_at: "2026-01-01T00:00:00Z".to_string(),
+            tarball_url: "https://example.com/source.tar.gz".to_string(),
+            body: String::new(),
+        }
+    }
+
+    fn asset(name: &str, url: &str) -> Asset {
+        Asset {
+            url: format!("{}/api", url),
+            id: 1,
+            name: name.to_string(),
+            content_type: "application/gzip".to_string(),
+            state: "uploaded".to_string(),
+            size: 1024,
+            download_count: 0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            browser_download_url: url.to_string(),
+        }
+    }
 }
