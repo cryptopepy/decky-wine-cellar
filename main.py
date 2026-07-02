@@ -21,6 +21,9 @@ settings.read()
 class Plugin:
     BACKEND_PATH = f"{PLUGIN_DIR}/bin/backend"
     BACKEND_PROC: typing.Optional[asyncio.subprocess.Process] = None
+    BACKEND_WATCH_TASK: typing.Optional[asyncio.Task[None]] = None
+    BACKEND_STOPPING = False
+    BACKEND_RESTART_DELAY_SECONDS = 2
 
     @classmethod
     async def _spawn_backend(cls):
@@ -29,30 +32,78 @@ class Plugin:
         logger.info(f"Wine Cask started with PID {cls.BACKEND_PROC.pid}")
 
     @classmethod
-    async def _stop_backend(cls):
-        if cls.BACKEND_PROC is None:
-            logger.warning("Wine Cask is not running!")
+    async def _backend_supervisor(cls):
+        while not cls.BACKEND_STOPPING:
+            try:
+                await cls._spawn_backend()
+            except Exception:
+                logger.exception("Failed to start Wine Cask")
+                await asyncio.sleep(cls.BACKEND_RESTART_DELAY_SECONDS)
+                continue
+
+            backend_proc = cls.BACKEND_PROC
+            if backend_proc is None:
+                await asyncio.sleep(cls.BACKEND_RESTART_DELAY_SECONDS)
+                continue
+
+            returncode = await backend_proc.wait()
+            if cls.BACKEND_PROC is backend_proc:
+                cls.BACKEND_PROC = None
+
+            if cls.BACKEND_STOPPING:
+                logger.info(f"Wine Cask stopped with exit code {returncode}")
+                return
+
+            logger.error(
+                f"Wine Cask exited unexpectedly with exit code {returncode}; restarting..."
+            )
+            await asyncio.sleep(cls.BACKEND_RESTART_DELAY_SECONDS)
+
+    @classmethod
+    async def _start_backend_supervisor(cls):
+        if cls.BACKEND_WATCH_TASK is not None and not cls.BACKEND_WATCH_TASK.done():
+            logger.warning("Wine Cask supervisor is already running!")
             return
 
-        logger.info("Terminating Wine Cask (the Wine Cellar backend)...")
-        cls.BACKEND_PROC.terminate()
+        cls.BACKEND_STOPPING = False
+        cls.BACKEND_WATCH_TASK = asyncio.create_task(cls._backend_supervisor())
 
-        try:
-            await asyncio.wait_for(cls.BACKEND_PROC.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            logger.warning("Wine Cask did not exit after SIGTERM, killing process...")
-            cls.BACKEND_PROC.kill()
-            await cls.BACKEND_PROC.wait()
+    @classmethod
+    async def _stop_backend(cls):
+        cls.BACKEND_STOPPING = True
 
-        cls.BACKEND_PROC = None
+        if cls.BACKEND_PROC is None:
+            logger.warning("Wine Cask is not running!")
+        else:
+            logger.info("Terminating Wine Cask (the Wine Cellar backend)...")
+            cls.BACKEND_PROC.terminate()
+
+            try:
+                await asyncio.wait_for(cls.BACKEND_PROC.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning("Wine Cask did not exit after SIGTERM, killing process...")
+                cls.BACKEND_PROC.kill()
+                await cls.BACKEND_PROC.wait()
+
+            cls.BACKEND_PROC = None
+
+        watch_task = cls.BACKEND_WATCH_TASK
+        if watch_task is not None and watch_task is not asyncio.current_task():
+            try:
+                await asyncio.wait_for(watch_task, timeout=6)
+            except asyncio.TimeoutError:
+                watch_task.cancel()
+            except asyncio.CancelledError:
+                pass
+        cls.BACKEND_WATCH_TASK = None
 
     @classmethod
     async def _main(cls):
-        if cls.BACKEND_PROC is not None and cls.BACKEND_PROC.returncode is None:
+        if cls.BACKEND_WATCH_TASK is not None and not cls.BACKEND_WATCH_TASK.done():
             logger.warning("Wine Cask is already running!")
             return
 
-        await cls._spawn_backend()
+        await cls._start_backend_supervisor()
 
     @classmethod
     async def _unload(cls):
@@ -61,7 +112,7 @@ class Plugin:
     @classmethod
     async def restart_backend(cls):
         await cls._stop_backend()
-        await cls._spawn_backend()
+        await cls._start_backend_supervisor()
 
     @classmethod
     async def settings_read(cls):

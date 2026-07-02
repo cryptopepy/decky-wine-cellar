@@ -1,9 +1,10 @@
 import { SidebarNavigation, SidebarNavigationPage } from "@decky/ui";
 import { useEffect, useState } from "react";
 import { v4 as uuidv4 } from "uuid";
-import { AppState, MessageEnvelope, MessageType } from "../types";
+import { AppState, MessageType } from "../types";
 import { log } from "../utils/logger";
 import { reportSteamVisibleTools, requestState } from "../utils/backendApi";
+import { parseBackendMessage } from "../utils/backendMessages";
 import About from "./about";
 import FlavorTab from "./flavorTab";
 import ManagerTab from "./manager";
@@ -34,7 +35,11 @@ export default function ManagePage() {
       };
 
       websocket.onmessage = (event) => {
-        const response: MessageEnvelope = JSON.parse(event.data);
+        const response = parseBackendMessage(event.data);
+        if (response == null) {
+          return;
+        }
+
         if (response.type === MessageType.UpdateState && response.app_state != null) {
           setAppState(response.app_state);
           log("Received app state update");

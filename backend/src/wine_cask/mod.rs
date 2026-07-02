@@ -2,7 +2,7 @@ use crate::wine_cask::app::{Command, OperationState, WineCask};
 use crate::PeerMap;
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::{fs, io};
 
@@ -12,8 +12,19 @@ pub mod install;
 pub mod uninstall;
 pub mod virtual_tools;
 
-pub fn generate_compatibility_tool_vdf(path: PathBuf, internal_name: &str, display_name: &str) {
-    let mut file = File::create(path).expect("Failed to create file");
+pub fn generate_compatibility_tool_vdf<P: AsRef<Path>>(
+    path: P,
+    internal_name: &str,
+    display_name: &str,
+) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let internal_name = escape_vdf_string(internal_name);
+    let display_name = escape_vdf_string(display_name);
+    let mut file = File::create(path)?;
     writeln!(
         file,
         r#""compatibilitytools"
@@ -31,11 +42,32 @@ pub fn generate_compatibility_tool_vdf(path: PathBuf, internal_name: &str, displ
             }}"#,
         internal_name, display_name
     )
-    .expect("Failed to write to file");
+}
+
+fn escape_vdf_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => escaped.push(' '),
+            character => escaped.push(character),
+        }
+    }
+
+    escaped
 }
 
 fn recursive_delete_dir_entry(entry_path: &Path) -> io::Result<()> {
-    if entry_path.is_dir() {
+    let metadata = fs::symlink_metadata(entry_path)?;
+
+    if metadata.file_type().is_symlink() {
+        fs::remove_file(entry_path)?;
+    } else if metadata.is_dir() {
         for entry in fs::read_dir(entry_path)? {
             let entry = entry?;
             let path = entry.path();
@@ -47,6 +79,25 @@ fn recursive_delete_dir_entry(entry_path: &Path) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn generated_vdf_escapes_strings() {
+        let directory = tempdir().expect("Failed to create temp directory");
+        let vdf_path = directory.path().join("compatibilitytool.vdf");
+
+        generate_compatibility_tool_vdf(&vdf_path, r#"Wine"Cellar\Virtual"#, "Display\nName")
+            .expect("Failed to generate VDF");
+
+        let contents = fs::read_to_string(vdf_path).expect("Failed to read VDF");
+        assert!(contents.contains(r#""Wine\"Cellar\\Virtual""#));
+        assert!(contents.contains(r#""display_name" "Display\nName""#));
+    }
 }
 
 pub async fn process_queue(wine_cask: Arc<WineCask>, peer_map: PeerMap) {
@@ -115,7 +166,9 @@ pub async fn process_queue(wine_cask: Arc<WineCask>, peer_map: PeerMap) {
                     wine_cask
                         .update_current_operation(OperationState::Running, 0, &peer_map)
                         .await;
-                    wine_cask.remove_virtual_tool(virtual_tool_id, &peer_map).await;
+                    wine_cask
+                        .remove_virtual_tool(virtual_tool_id, &peer_map)
+                        .await;
                 }
                 Command::RefreshCatalog | Command::CancelOperation { .. } => {}
             }

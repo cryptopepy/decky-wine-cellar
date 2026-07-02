@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::time::Duration;
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Release {
@@ -43,8 +44,9 @@ pub async fn list_all_releases(
     let client = reqwest::Client::builder()
         .user_agent("FlashyReese/decky-wine-cellar")
         .no_proxy()
+        .timeout(Duration::from_secs(30))
         .build()
-        .expect("Failed to create HTTP client");
+        .map_err(GitHubUtilError::Request)?;
 
     let mut releases: Vec<Release> = Vec::new();
     let mut page = 1;
@@ -55,25 +57,7 @@ pub async fn list_all_releases(
             owner, repository, page
         );
 
-        let response = match client.get(&url).send().await {
-            Ok(response) => response,
-            Err(err) => {
-                eprintln!("reqwest display: {}", err);
-                eprintln!("reqwest debug: {:#?}", err);
-                eprintln!("is_connect: {}", err.is_connect());
-                eprintln!("is_timeout: {}", err.is_timeout());
-                eprintln!("is_request: {}", err.is_request());
-                eprintln!("url: {:?}", err.url());
-
-                let mut source = err.source();
-                while let Some(src) = source {
-                    eprintln!("caused by: {}", src);
-                    source = src.source();
-                }
-
-                return Err(err.into());
-            }
-        };
+        let response = client.get(&url).send().await?;
 
         let response = response.error_for_status()?;
 

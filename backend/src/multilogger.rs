@@ -37,21 +37,21 @@ impl log::Log for MultiLogger {
                 record.args()
             );
 
-            self.stdout
-                .lock()
-                .unwrap()
-                .write_all(log_msg.as_bytes())
-                .unwrap();
-            self.file
-                .lock()
-                .unwrap()
-                .write_all(log_msg.as_bytes())
-                .unwrap();
+            if let Ok(mut stdout) = self.stdout.lock() {
+                let _ = stdout.write_all(log_msg.as_bytes());
+            }
+            if let Ok(mut file) = self.file.lock() {
+                let _ = file.write_all(log_msg.as_bytes());
+            }
         }
     }
 
     fn flush(&self) {
-        self.stdout.lock().unwrap().flush().unwrap();
-        self.file.lock().unwrap().flush().unwrap();
+        if let Ok(mut stdout) = self.stdout.lock() {
+            let _ = stdout.flush();
+        }
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.flush();
+        }
     }
 }

@@ -1,6 +1,7 @@
 import { toaster, ToastData } from "@decky/api";
 import { v4 as uuidv4 } from "uuid";
-import { MessageEnvelope, MessageType } from "../types";
+import { MessageType } from "../types";
+import { parseBackendMessage } from "./backendMessages";
 import { error, log } from "./logger";
 
 let shouldReconnect = true;
@@ -25,7 +26,11 @@ export const setupToasts = (): void => {
     };
 
     socket.onmessage = (event: MessageEvent): void => {
-      const response: MessageEnvelope = JSON.parse(event.data);
+      const response = parseBackendMessage(event.data);
+      if (response == null) {
+        return;
+      }
+
       if (
         response.type === MessageType.Notification &&
         response.notification != null &&

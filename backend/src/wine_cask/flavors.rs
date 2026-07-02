@@ -3,7 +3,7 @@ use crate::github_util::Release;
 use crate::wine_cask::app::WineCask;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
@@ -181,9 +181,10 @@ impl WineCask {
         releases
             .into_iter()
             .filter(|release| {
-                release.assets.iter().any(|asset| {
-                    allowed_arches.iter().any(|arch| asset.name.contains(arch))
-                })
+                release
+                    .assets
+                    .iter()
+                    .any(|asset| allowed_arches.iter().any(|arch| asset.name.contains(arch)))
             })
             .collect()
     }
@@ -223,37 +224,40 @@ impl WineCask {
     ) -> Option<Vec<Release>> {
         const SECONDS_IN_A_DAY: u64 = 86_400;
 
-        let path = env::var("DECKY_PLUGIN_RUNTIME_DIR").unwrap_or("/tmp/".parse().unwrap());
+        let path = env::var("DECKY_PLUGIN_RUNTIME_DIR").unwrap_or_else(|_| "/tmp/".to_string());
 
         let file_name = format!("github_releases_{}_{}_cache.json", owner, repository);
         let cache_file = PathBuf::from(path).join(&file_name);
 
         if !renew_cache && cache_file.exists() && cache_file.is_file() {
-            let metadata = fs::metadata(&cache_file).ok()?;
-            let modified = metadata.modified().ok()?;
+            match read_cached_releases(&cache_file) {
+                Ok((modified, github_releases)) => {
+                    let duration = SystemTime::now()
+                        .duration_since(modified)
+                        .unwrap_or_default();
 
-            let now = SystemTime::now();
-            let duration = now.duration_since(modified).ok()?;
+                    if duration.as_secs() < SECONDS_IN_A_DAY {
+                        self.app_state.lock().await.updater_last_check =
+                            Some(unix_timestamp(modified));
 
-            if duration.as_secs() < SECONDS_IN_A_DAY {
-                let unix_timestamp = modified
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Failed to calculate duration")
-                    .as_secs();
-                self.app_state.lock().await.updater_last_check = Some(unix_timestamp);
-
-                let string = fs::read_to_string(&cache_file).ok()?;
-                let github_releases: Vec<Release> = serde_json::from_str(&string).ok()?;
-
-                if github_releases.is_empty() {
-                    info!(
-                        "Cached data is possibly corrupted or missing information from an older version. Renewing cache..."
-                    );
-                } else {
-                    return Some(github_releases);
+                        if github_releases.is_empty() {
+                            info!(
+                                "Cached data is possibly corrupted or missing information from an older version. Renewing cache..."
+                            );
+                        } else {
+                            return Some(github_releases);
+                        }
+                    } else {
+                        info!("Cache file is older than 1 day. Fetching new releases.");
+                    }
                 }
-            } else {
-                info!("Cache file is older than 1 day. Fetching new releases.");
+                Err(err) => {
+                    warn!(
+                        "Failed to read cached releases from {}: {}",
+                        cache_file.display(),
+                        err
+                    );
+                }
             }
         }
 
@@ -265,14 +269,25 @@ impl WineCask {
                 }
 
                 let current_time = SystemTime::now();
-                let unix_timestamp = current_time
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Failed to calculate duration")
-                    .as_secs();
-                self.app_state.lock().await.updater_last_check = Some(unix_timestamp);
+                self.app_state.lock().await.updater_last_check = Some(unix_timestamp(current_time));
 
-                let json = serde_json::to_string(&releases).ok()?;
-                fs::write(&cache_file, json).ok()?;
+                match serde_json::to_string(&releases) {
+                    Ok(json) => {
+                        if let Some(parent) = cache_file.parent() {
+                            if let Err(err) = fs::create_dir_all(parent) {
+                                warn!("Failed to prepare release cache directory: {}", err);
+                            }
+                        }
+                        if let Err(err) = fs::write(&cache_file, json) {
+                            warn!(
+                                "Failed to write release cache {}: {}",
+                                cache_file.display(),
+                                err
+                            );
+                        }
+                    }
+                    Err(err) => warn!("Failed to serialize release cache: {}", err),
+                }
                 releases
             }
             Err(err) => {
@@ -280,18 +295,21 @@ impl WineCask {
                 error!("full debug error: {err:#?}");
 
                 if cache_file.exists() && cache_file.is_file() {
-                    let metadata = fs::metadata(&cache_file).ok()?;
-                    let modified = metadata.modified().ok()?;
-                    let unix_timestamp = modified
-                        .duration_since(UNIX_EPOCH)
-                        .expect("Failed to calculate duration")
-                        .as_secs();
-                    self.app_state.lock().await.updater_last_check = Some(unix_timestamp);
-
-                    let string = fs::read_to_string(&cache_file).ok()?;
-                    let github_releases: Vec<Release> = serde_json::from_str(&string).ok()?;
-                    warn!("Unable to fetch new releases. Using cached releases.");
-                    github_releases
+                    match read_cached_releases(&cache_file) {
+                        Ok((modified, github_releases)) => {
+                            self.app_state.lock().await.updater_last_check =
+                                Some(unix_timestamp(modified));
+                            warn!("Unable to fetch new releases. Using cached releases.");
+                            github_releases
+                        }
+                        Err(cache_err) => {
+                            error!(
+                                "Unable to fetch new releases and cached releases are unusable: {}",
+                                cache_err
+                            );
+                            return None;
+                        }
+                    }
                 } else {
                     error!("Unable to fetch new releases. No cached releases found.");
                     return None;
@@ -301,4 +319,24 @@ impl WineCask {
 
         Some(github_releases)
     }
+}
+
+fn read_cached_releases(cache_file: &Path) -> Result<(SystemTime, Vec<Release>), String> {
+    let metadata =
+        fs::metadata(cache_file).map_err(|err| format!("failed to read metadata: {}", err))?;
+    let modified = metadata
+        .modified()
+        .map_err(|err| format!("failed to read modified timestamp: {}", err))?;
+    let contents =
+        fs::read_to_string(cache_file).map_err(|err| format!("failed to read file: {}", err))?;
+    let releases = serde_json::from_str::<Vec<Release>>(&contents)
+        .map_err(|err| format!("failed to parse JSON: {}", err))?;
+
+    Ok((modified, releases))
+}
+
+fn unix_timestamp(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }

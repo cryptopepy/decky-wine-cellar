@@ -9,9 +9,15 @@ use log::{error, info, warn};
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use tokio::fs::File as TokioFile;
 use tokio::io::AsyncWriteExt;
 use xz2::bufread::XzDecoder;
+
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_ARCHIVE_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_EXTRACTED_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 25_000;
 
 #[derive(Clone)]
 struct InstallPlan {
@@ -29,6 +35,7 @@ enum CompressionType {
 struct DownloadPlan {
     url: String,
     compression_type: CompressionType,
+    expected_size: u64,
 }
 
 impl WineCask {
@@ -59,6 +66,15 @@ impl WineCask {
             .await;
             return;
         };
+
+        if download_plan.expected_size > MAX_ARCHIVE_SIZE_BYTES {
+            self.broadcast_notification(
+                peer_map,
+                "Error: Compatibility tool archive is larger than the supported limit",
+            )
+            .await;
+            return;
+        }
 
         self.update_current_operation(OperationState::Downloading, 0, peer_map)
             .await;
@@ -93,7 +109,19 @@ impl WineCask {
             }
         };
 
-        let client = reqwest::Client::new();
+        let client = match reqwest::Client::builder().timeout(DOWNLOAD_TIMEOUT).build() {
+            Ok(client) => client,
+            Err(err) => {
+                error!("Failed to create download client: {}", err);
+                cleanup_temp_directory(&temp_dir);
+                self.broadcast_notification(
+                    peer_map,
+                    "Connection error: Unable to prepare compatibility tool download",
+                )
+                .await;
+                return;
+            }
+        };
         let response = match client.get(&download_plan.url).send().await {
             Ok(resp) => resp,
             Err(err) => {
@@ -117,6 +145,18 @@ impl WineCask {
         }
 
         let total_size = response.content_length();
+        if total_size
+            .map(|size| size > MAX_ARCHIVE_SIZE_BYTES)
+            .unwrap_or(false)
+        {
+            cleanup_temp_directory(&temp_dir);
+            self.broadcast_notification(
+                peer_map,
+                "Error: Compatibility tool archive is larger than the supported limit",
+            )
+            .await;
+            return;
+        }
         let mut downloaded_size = 0u64;
         let mut body = response.bytes_stream();
 
@@ -150,6 +190,15 @@ impl WineCask {
                 return;
             }
             downloaded_size += chunk.len() as u64;
+            if downloaded_size > MAX_ARCHIVE_SIZE_BYTES {
+                cleanup_temp_directory(&temp_dir);
+                self.broadcast_notification(
+                    peer_map,
+                    "Error: Compatibility tool archive is larger than the supported limit",
+                )
+                .await;
+                return;
+            }
 
             if let Some(total_size) = total_size {
                 if total_size > 0 {
@@ -303,7 +352,8 @@ impl WineCask {
                         install_plan.catalog_release.flavor,
                         install_plan.catalog_release.release.tag_name
                     ),
-                );
+                )
+                .map_err(|err| format!("Failed to write compatibility tool VDF: {}", err))?;
                 temp_dir.join(&new_folder_name)
             }
             CompatibilityToolFlavor::Unknown => {
@@ -361,23 +411,68 @@ impl WineCask {
             .get_steam_compatibility_tools_directory()
             .join(&virtual_tool.directory_name);
 
-        if target_directory.exists() {
-            recursive_delete_dir_entry(&target_directory)
-                .map_err(|err| format!("Failed to replace virtual tool contents: {}", err))?;
+        let backup_directory = target_directory.with_file_name(format!(
+            ".wine-cellar-backup-{}",
+            virtual_tool.directory_name
+        ));
+        if backup_directory.exists() {
+            recursive_delete_dir_entry(&backup_directory)
+                .map_err(|err| format!("Failed to clear stale virtual tool backup: {}", err))?;
         }
 
-        std::fs::rename(extracted_directory, &target_directory)
-            .map_err(|err| format!("Failed to move virtual tool contents into place: {}", err))?;
-        generate_compatibility_tool_vdf(
-            target_directory.join("compatibilitytool.vdf"),
-            &virtual_tool.steam_internal_name,
-            &virtual_tool.user_label,
-        );
+        let mut backup_created = false;
+        if target_directory.exists() {
+            std::fs::rename(&target_directory, &backup_directory).map_err(|err| {
+                format!(
+                    "Failed to prepare virtual tool contents for replacement: {}",
+                    err
+                )
+            })?;
+            backup_created = true;
+        }
 
-        self.update_virtual_tool_payload(
-            virtual_tool_id,
-            Some(install_plan.catalog_release.id.clone()),
-        )?;
+        let install_result = (|| {
+            std::fs::rename(extracted_directory, &target_directory).map_err(|err| {
+                format!("Failed to move virtual tool contents into place: {}", err)
+            })?;
+            generate_compatibility_tool_vdf(
+                target_directory.join("compatibilitytool.vdf"),
+                &virtual_tool.steam_internal_name,
+                &virtual_tool.user_label,
+            )
+            .map_err(|err| format!("Failed to write virtual tool VDF: {}", err))?;
+
+            self.update_virtual_tool_payload(
+                virtual_tool_id,
+                Some(install_plan.catalog_release.id.clone()),
+            )
+        })();
+
+        if let Err(err) = install_result {
+            if target_directory.exists() {
+                if let Err(cleanup_err) = recursive_delete_dir_entry(&target_directory) {
+                    warn!(
+                        "Failed to clean up incomplete virtual tool payload: {}",
+                        cleanup_err
+                    );
+                }
+            }
+            if backup_created {
+                if let Err(rollback_err) = std::fs::rename(&backup_directory, &target_directory) {
+                    return Err(format!(
+                        "{}; failed to restore previous virtual tool contents: {}",
+                        err, rollback_err
+                    ));
+                }
+            }
+            return Err(err);
+        }
+
+        if backup_created {
+            if let Err(err) = recursive_delete_dir_entry(&backup_directory) {
+                warn!("Failed to remove virtual tool backup: {}", err);
+            }
+        }
 
         Ok(format!(
             "Mounted {} into {}",
@@ -393,22 +488,41 @@ fn safe_unpack_tar(reader: Box<dyn Read>, destination: &Path) -> Result<(), Stri
         .entries()
         .map_err(|err| format!("Failed to read tar entries: {}", err))?;
 
+    let mut entry_count = 0usize;
+    let mut total_unpacked_size = 0u64;
     for entry in entries {
         let mut entry = entry.map_err(|err| format!("Failed to process tar entry: {}", err))?;
+        entry_count += 1;
+        if entry_count > MAX_ARCHIVE_ENTRIES {
+            return Err("Archive contains too many entries".to_string());
+        }
+
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink()
+            || entry_type.is_hard_link()
+            || entry_type.is_block_special()
+            || entry_type.is_character_special()
+            || entry_type.is_fifo()
+        {
+            return Err("Archive contains unsupported special entries".to_string());
+        }
+
         let path = entry
             .path()
             .map_err(|err| format!("Failed to resolve tar entry path: {}", err))?;
 
-        if path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        }) {
+        if !archive_path_is_safe(&path) {
             return Err(format!(
                 "Unsafe archive entry path detected: {}",
                 path.display()
             ));
+        }
+
+        total_unpacked_size = total_unpacked_size
+            .checked_add(entry.size())
+            .ok_or_else(|| "Archive unpacked size overflowed".to_string())?;
+        if total_unpacked_size > MAX_EXTRACTED_SIZE_BYTES {
+            return Err("Archive unpacked size is larger than the supported limit".to_string());
         }
 
         entry
@@ -417,6 +531,15 @@ fn safe_unpack_tar(reader: Box<dyn Read>, destination: &Path) -> Result<(), Stri
     }
 
     Ok(())
+}
+
+fn archive_path_is_safe(path: &Path) -> bool {
+    !path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
 }
 
 fn prepare_temp_directory(staging_root: &Path) -> Option<PathBuf> {
@@ -481,6 +604,7 @@ fn look_for_compressed_archive(release: &Release) -> Option<DownloadPlan> {
         .map(|asset| DownloadPlan {
             url: asset.browser_download_url.clone(),
             compression_type: compression_type(asset),
+            expected_size: asset.size,
         })
         .next()
 }
@@ -497,6 +621,28 @@ fn is_steam_deck_archive(asset: &Asset) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use tar::{Builder, EntryType, Header};
+    use tempfile::tempdir;
+
+    #[test]
+    fn archive_path_safety_rejects_parent_and_absolute_paths() {
+        assert!(!archive_path_is_safe(Path::new("../evil")));
+        assert!(!archive_path_is_safe(Path::new("tool/../../evil")));
+        assert!(!archive_path_is_safe(Path::new("/evil")));
+        assert!(archive_path_is_safe(Path::new("tool/file")));
+    }
+
+    #[test]
+    fn safe_unpack_tar_rejects_symlink_entries() {
+        let archive = archive_with_symlink("tool/link", "target");
+        let destination = tempdir().expect("Failed to create temp directory");
+
+        let err = safe_unpack_tar(Box::new(Cursor::new(archive)), destination.path())
+            .expect_err("Expected symlink archive entry to be rejected");
+
+        assert!(err.contains("unsupported special entries"));
+    }
 
     #[test]
     fn archive_selection_skips_aarch64_build_when_generic_build_exists() {
@@ -535,6 +681,25 @@ mod tests {
 
         assert_eq!(plan.url, "https://example.com/x86_64_v3");
         assert_eq!(plan.compression_type, CompressionType::Xz);
+    }
+
+    fn archive_with_symlink(path: &str, target: &str) -> Vec<u8> {
+        let mut archive = Vec::new();
+        {
+            let mut builder = Builder::new(&mut archive);
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::Symlink);
+            header
+                .set_link_name(target)
+                .expect("Failed to set symlink target");
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, std::io::empty())
+                .expect("Failed to append symlink entry");
+            builder.finish().expect("Failed to finish tar archive");
+        }
+        archive
     }
 
     fn release_with_assets(assets: Vec<Asset>) -> Release {

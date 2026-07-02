@@ -4,9 +4,12 @@ use crate::wine_cask::recursive_delete_dir_entry;
 use crate::PeerMap;
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
-use std::fs::create_dir_all;
+use std::fs::{create_dir_all, File};
+use std::io::Write;
 use std::path::Path;
 use std::{fs, io};
+
+const MAX_VIRTUAL_TOOL_LABEL_CHARS: usize = 64;
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct VirtualToolManifest {
@@ -82,15 +85,23 @@ impl WineCask {
         let manifest_json = serde_json::to_string_pretty(manifest)
             .map_err(|err| format!("Failed to serialize virtual tool manifest: {}", err))?;
 
-        fs::write(&self.virtual_tool_manifest_path, manifest_json)
+        let temp_manifest_path = self.virtual_tool_manifest_path.with_extension("json.tmp");
+        let mut temp_manifest = File::create(&temp_manifest_path)
+            .map_err(|err| format!("Failed to create virtual tool manifest temp file: {}", err))?;
+        temp_manifest
+            .write_all(manifest_json.as_bytes())
+            .map_err(|err| format!("Failed to write virtual tool manifest temp file: {}", err))?;
+        temp_manifest
+            .sync_all()
+            .map_err(|err| format!("Failed to flush virtual tool manifest temp file: {}", err))?;
+        drop(temp_manifest);
+
+        fs::rename(&temp_manifest_path, &self.virtual_tool_manifest_path)
             .map_err(|err| format!("Failed to persist virtual tool manifest: {}", err))
     }
 
     pub fn create_virtual_tool_slot(&self, user_label: String) -> Result<String, String> {
-        let trimmed_label = user_label.trim().to_string();
-        if trimmed_label.is_empty() {
-            return Err("Virtual tool name cannot be empty".to_string());
-        }
+        let trimmed_label = normalize_virtual_tool_label(&user_label)?;
 
         let mut manifest = self.load_virtual_tool_manifest();
         let (id, steam_internal_name, directory_name) = manifest.next_tool_identity();
@@ -101,11 +112,19 @@ impl WineCask {
 
         create_dir_all(&tool_dir)
             .map_err(|err| format!("Failed to create virtual tool directory: {}", err))?;
-        generate_compatibility_tool_vdf(
+        if let Err(err) = generate_compatibility_tool_vdf(
             tool_dir.join("compatibilitytool.vdf"),
             &steam_internal_name,
             &trimmed_label,
-        );
+        ) {
+            if let Err(cleanup_err) = fs::remove_dir_all(&tool_dir) {
+                error!(
+                    "Failed to roll back virtual tool directory after VDF write error: {}",
+                    cleanup_err
+                );
+            }
+            return Err(format!("Failed to write virtual tool VDF: {}", err));
+        }
 
         manifest.tools.push(VirtualToolConfig {
             id,
@@ -133,10 +152,7 @@ impl WineCask {
         virtual_tool_id: &str,
         user_label: String,
     ) -> Result<String, String> {
-        let trimmed_label = user_label.trim().to_string();
-        if trimmed_label.is_empty() {
-            return Err("Virtual tool name cannot be empty".to_string());
-        }
+        let trimmed_label = normalize_virtual_tool_label(&user_label)?;
 
         let mut manifest = self.load_virtual_tool_manifest();
         let Some(config) = manifest
@@ -197,11 +213,7 @@ impl WineCask {
         Ok(removed_tool.user_label)
     }
 
-    pub async fn remove_virtual_tool(
-        &self,
-        virtual_tool_id: String,
-        peer_map: &PeerMap,
-    ) {
+    pub async fn remove_virtual_tool(&self, virtual_tool_id: String, peer_map: &PeerMap) {
         let Some(virtual_tool) = self.get_virtual_tool(&virtual_tool_id).await else {
             self.broadcast_notification(peer_map, "Virtual tool not found")
                 .await;
@@ -236,7 +248,10 @@ impl WineCask {
         self.broadcast_app_state(peer_map).await;
         self.broadcast_notification(
             peer_map,
-            &format!("Removed virtual compatibility tool: {}", virtual_tool.user_label),
+            &format!(
+                "Removed virtual compatibility tool: {}",
+                virtual_tool.user_label
+            ),
         )
         .await;
     }
@@ -252,7 +267,7 @@ fn rewrite_virtual_tool_vdf(
         tool_dir.join("compatibilitytool.vdf"),
         steam_internal_name,
         user_label,
-    );
+    )?;
     Ok(())
 }
 
@@ -261,9 +276,12 @@ fn remove_virtual_tool_directory(base_dir: &Path, tool_dir: &Path) -> Result<(),
         return Ok(());
     }
 
-    let canonical_base = base_dir
-        .canonicalize()
-        .map_err(|err| format!("Failed to access compatibility tools base directory: {}", err))?;
+    let canonical_base = base_dir.canonicalize().map_err(|err| {
+        format!(
+            "Failed to access compatibility tools base directory: {}",
+            err
+        )
+    })?;
     let canonical_target = tool_dir
         .canonicalize()
         .map_err(|err| format!("Failed to access virtual tool directory: {}", err))?;
@@ -274,4 +292,27 @@ fn remove_virtual_tool_directory(base_dir: &Path, tool_dir: &Path) -> Result<(),
 
     recursive_delete_dir_entry(&canonical_target)
         .map_err(|err| format!("Error removing virtual compatibility tool: {}", err))
+}
+
+pub(crate) fn normalize_virtual_tool_label(user_label: &str) -> Result<String, String> {
+    let trimmed_label = user_label.trim().to_string();
+    if trimmed_label.is_empty() {
+        return Err("Virtual tool name cannot be empty".to_string());
+    }
+
+    if trimmed_label.chars().count() > MAX_VIRTUAL_TOOL_LABEL_CHARS {
+        return Err(format!(
+            "Virtual tool name must be {} characters or fewer",
+            MAX_VIRTUAL_TOOL_LABEL_CHARS
+        ));
+    }
+
+    if trimmed_label
+        .chars()
+        .any(|character| character.is_control())
+    {
+        return Err("Virtual tool name cannot contain control characters".to_string());
+    }
+
+    Ok(trimmed_label)
 }

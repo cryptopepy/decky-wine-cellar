@@ -185,7 +185,13 @@ impl SteamUtil {
         let compat_tools: Vec<CompatibilityTool> = entries
             .filter_map(Result::ok)
             .filter(|x| {
+                let is_wine_cellar_internal_dir = x
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.starts_with(".wine-cellar-"))
+                    .unwrap_or(false);
                 x.metadata().map(|m| m.is_dir()).unwrap_or(false)
+                    && !is_wine_cellar_internal_dir
                     && x.path().join("compatibilitytool.vdf").exists()
             })
             .flat_map(|x| {

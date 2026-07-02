@@ -3,6 +3,7 @@ use crate::wine_cask::flavors::{
     CatalogRelease, CompatibilityToolFlavor, Flavor, InstalledCompatibilityTool,
     InstalledToolSource, SteamClientCompatToolInfo, VirtualCompatibilityTool,
 };
+use crate::wine_cask::virtual_tools::normalize_virtual_tool_label;
 use crate::PeerMap;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -291,6 +292,42 @@ impl WineCask {
             .clone()
             .unwrap_or_else(|| installed_tool.display_name.clone());
 
+        let app_state = self.app_state.lock().await;
+        if app_state
+            .current_operation
+            .as_ref()
+            .map(|operation| {
+                operation_targets_installed_tool(operation, &installed_tool_id)
+                    || installed_tool
+                        .virtual_tool_id
+                        .as_deref()
+                        .map(|virtual_tool_id| {
+                            operation_targets_virtual_tool(operation, virtual_tool_id)
+                        })
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false)
+            || app_state.operation_queue.iter().any(|queued| {
+                operation_targets_installed_tool(&queued.operation, &installed_tool_id)
+                    || installed_tool
+                        .virtual_tool_id
+                        .as_deref()
+                        .map(|virtual_tool_id| {
+                            operation_targets_virtual_tool(&queued.operation, virtual_tool_id)
+                        })
+                        .unwrap_or(false)
+            })
+        {
+            drop(app_state);
+            self.broadcast_notification(
+                peer_map,
+                "That compatibility tool already has an active or queued operation",
+            )
+            .await;
+            return;
+        }
+        drop(app_state);
+
         let queued_command = QueuedCommand {
             command: Command::UninstallInstalledTool { installed_tool_id },
             operation: OperationInfo {
@@ -316,12 +353,13 @@ impl WineCask {
     }
 
     pub async fn queue_create_virtual_tool(&self, user_label: String, peer_map: &PeerMap) {
-        let trimmed_label = user_label.trim().to_string();
-        if trimmed_label.is_empty() {
-            self.broadcast_notification(peer_map, "Virtual tool name cannot be empty")
-                .await;
-            return;
-        }
+        let trimmed_label = match normalize_virtual_tool_label(&user_label) {
+            Ok(label) => label,
+            Err(err) => {
+                self.broadcast_notification(peer_map, &err).await;
+                return;
+            }
+        };
 
         let queued_command = QueuedCommand {
             command: Command::CreateVirtualTool {
@@ -355,18 +393,40 @@ impl WineCask {
         user_label: String,
         peer_map: &PeerMap,
     ) {
-        let trimmed_label = user_label.trim().to_string();
-        if trimmed_label.is_empty() {
-            self.broadcast_notification(peer_map, "Virtual tool name cannot be empty")
-                .await;
-            return;
-        }
+        let trimmed_label = match normalize_virtual_tool_label(&user_label) {
+            Ok(label) => label,
+            Err(err) => {
+                self.broadcast_notification(peer_map, &err).await;
+                return;
+            }
+        };
 
         let Some(virtual_tool) = self.get_virtual_tool(&virtual_tool_id).await else {
             self.broadcast_notification(peer_map, "Unknown virtual tool requested")
                 .await;
             return;
         };
+
+        let app_state = self.app_state.lock().await;
+        if app_state
+            .current_operation
+            .as_ref()
+            .map(|operation| operation_targets_virtual_tool(operation, &virtual_tool_id))
+            .unwrap_or(false)
+            || app_state
+                .operation_queue
+                .iter()
+                .any(|queued| operation_targets_virtual_tool(&queued.operation, &virtual_tool_id))
+        {
+            drop(app_state);
+            self.broadcast_notification(
+                peer_map,
+                "That virtual tool already has an active or queued operation",
+            )
+            .await;
+            return;
+        }
+        drop(app_state);
 
         let queued_command = QueuedCommand {
             command: Command::RenameVirtualTool {
@@ -395,11 +455,7 @@ impl WineCask {
         self.broadcast_operation_state(peer_map).await;
     }
 
-    pub async fn queue_remove_virtual_tool(
-        &self,
-        virtual_tool_id: String,
-        peer_map: &PeerMap,
-    ) {
+    pub async fn queue_remove_virtual_tool(&self, virtual_tool_id: String, peer_map: &PeerMap) {
         let Some(virtual_tool) = self.get_virtual_tool(&virtual_tool_id).await else {
             self.broadcast_notification(peer_map, "Unknown virtual tool requested")
                 .await;
@@ -827,7 +883,11 @@ fn find_catalog_release_for_tool(
                     return Some(catalog_release.clone());
                 }
             } else if flavor.flavor == CompatibilityToolFlavor::ProtonCachyOS {
-                if installed_tool.display_name.to_lowercase().contains("cachyos") {
+                if installed_tool
+                    .display_name
+                    .to_lowercase()
+                    .contains("cachyos")
+                {
                     return Some(catalog_release.clone());
                 }
             } else if installed_tool.display_name
@@ -876,6 +936,10 @@ fn duplicate_install_notification_message(target: &InstallTarget) -> &'static st
 
 fn operation_targets_virtual_tool(operation: &OperationInfo, virtual_tool_id: &str) -> bool {
     operation.virtual_tool_id.as_deref() == Some(virtual_tool_id)
+}
+
+fn operation_targets_installed_tool(operation: &OperationInfo, installed_tool_id: &str) -> bool {
+    operation.installed_tool_id.as_deref() == Some(installed_tool_id)
 }
 
 fn should_skip_operation_broadcast(
